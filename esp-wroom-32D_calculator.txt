@@ -1,0 +1,333 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Keypad.h>
+#include <string.h>
+#include <vector>
+#include <climits>
+
+#define OLED_RESET -1
+#define DOUBLE_PRESS_DELAY 300
+Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
+
+const byte rows = 4;
+const byte cols = 3;
+char keys[rows][cols] = {
+  {'1','2','3'},
+  {'4','5','6'},
+  {'7','8','9'},
+  {'*','0','#'}
+};
+byte rowPins[rows] = {13, 12, 14, 27};
+byte colPins[cols] = {26, 25, 33};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, rows, cols);
+
+String expression = "";         // Stores the complete expression
+String currentNumber = "";      // Stores the current number being typed
+unsigned long lastKeyPressTime = 0;
+char lastKey = '\0';
+bool waitingForDoubleTap = false;
+char pendingKey = '\0';
+unsigned long pendingKeyTime = 0;
+bool errorOccurred = false;     // Global error flag
+
+void setup() {
+  Serial.begin(115200);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.display();
+  delay(2000);
+  display.clearDisplay();
+  displayText("Calculator Ready");
+}
+
+void loop() {
+  char key = keypad.getKey();
+  unsigned long currentTime = millis();
+  
+  if (waitingForDoubleTap && (currentTime - pendingKeyTime > DOUBLE_PRESS_DELAY)) {
+    waitingForDoubleTap = false;
+    processSinglePress(pendingKey);
+    pendingKey = '\0';
+  }
+  
+  if (key != NO_KEY) {
+    if (waitingForDoubleTap && key == pendingKey) {
+      waitingForDoubleTap = false;
+      pendingKey = '\0';
+      processDoublePress(key);
+    } else {
+      if (pendingKey != '\0') {
+        processSinglePress(pendingKey);
+      }
+      pendingKey = key;
+      pendingKeyTime = currentTime;
+      waitingForDoubleTap = true;
+    }
+    lastKey = key;
+    lastKeyPressTime = currentTime;
+  }
+}
+
+void processSinglePress(char key) {
+  if (key >= '0' && key <= '9') {
+    currentNumber += key;
+    expression += key;
+  } else if (key == '*') {
+    if (!currentNumber.isEmpty()) {
+      expression += " ^ ";
+      currentNumber = "";
+    }
+  } else if (key == '#') {  // Calculate on single press of #
+    calculateResult();
+    return;
+  }
+  displayText(expression);
+}
+
+void processDoublePress(char key) {
+  if (!currentNumber.isEmpty()) {
+    currentNumber = "";
+  }
+  
+  if (key == '1') {
+    expression += " + ";
+  } else if (key == '3') {
+    expression += " - ";
+  } else if (key == '7') {
+    expression += " * ";
+  } else if (key == '9') {
+    expression += " / ";
+  } else if (key == '*') {
+    expression += " % ";
+  } else if (key == '4') {
+    expression += " ( ";
+  } else if (key == '6') {
+    expression += " ) ";
+  } else if (key == '#') {
+    clearCalculator();  // Clear on double press of #
+    return;
+  }
+  displayText(expression);
+}
+
+void calculateResult() {
+  if (expression.isEmpty()) return;
+  
+  try {
+    long long result = evaluateExpression(expression);
+    if (errorOccurred) {
+      displayText("Error");
+      delay(2000);
+      clearCalculator();
+      return;
+    }
+    
+    String resultStr = String(result);
+    // Show expression with result
+    String finalExpression = expression + " = " + resultStr;
+    displayText(finalExpression);
+    delay(2000);
+    
+    // Set result as new expression
+    expression = resultStr;
+    currentNumber = "";
+    displayText(expression);
+  } catch (...) {
+    displayText("Error");
+    delay(2000);
+    clearCalculator();
+  }
+}
+
+int getPrecedence(char op) {
+  switch (op) {
+    case '+': case '-':
+      return 1;
+    case '*': case '/': case '%':
+      return 2;
+    case '^':
+      return 3;
+    default:
+      return 0;
+  }
+}
+
+bool willMultiplyOverflow(long long a, long long b) {
+  if (a == 0 || b == 0) return false;
+  if (a > LLONG_MAX / b || a < LLONG_MIN / b) {
+    return true;
+  }
+  return false;
+}
+
+long long power(long long base, long long exp) {
+  if (exp == 0) return 1;
+  long long result = 1;
+  while (exp > 0) {
+    if (exp % 2 == 1) {
+      if (willMultiplyOverflow(result, base)) {
+        errorOccurred = true;
+        return 0;
+      }
+      result *= base;
+    }
+    exp = exp / 2;
+    if (exp > 0) {
+      if (willMultiplyOverflow(base, base)) {
+        errorOccurred = true;
+        return 0;
+      }
+      base *= base;
+    }
+  }
+  return result;
+}
+
+long long evaluateExpression(String expr) {
+  std::vector<long long> numbers;
+  std::vector<char> operators;
+  String currentNum = "";
+  bool expectingNumber = true;
+  expr.replace("(", " ( ");
+  expr.replace(")", " ) ");
+  
+  for (size_t i = 0; i < expr.length(); i++) {
+    char c = expr[i];
+    if (c == ' ') continue;
+    if (c == '(') {
+      operators.push_back(c);
+      expectingNumber = true;
+    }
+    else if (c == ')') {
+      if (!currentNum.isEmpty()) {
+        numbers.push_back(atoll(currentNum.c_str()));
+        currentNum = "";
+      }
+      while (!operators.empty() && operators.back() != '(') {
+        if (numbers.size() < 2) {
+          errorOccurred = true;
+          return 0;
+        }
+        long long b = numbers.back(); numbers.pop_back();
+        long long a = numbers.back(); numbers.pop_back();
+        char op = operators.back(); operators.pop_back();
+        numbers.push_back(calculateBasicOperation(a, b, op));
+        if (errorOccurred) return 0;
+      }
+      if (!operators.empty()) operators.pop_back(); // Remove '('
+      expectingNumber = false;
+    }
+    else if ((c == '+' || c == '-' || c == '*' || c == '/' || c == '^' || c == '%') && !expectingNumber) {
+      if (!currentNum.isEmpty()) {
+        numbers.push_back(atoll(currentNum.c_str()));
+        currentNum = "";
+      }
+      while (!operators.empty() && operators.back() != '(' &&
+             getPrecedence(c) <= getPrecedence(operators.back())) {
+        if (numbers.size() < 2) {
+          errorOccurred = true;
+          return 0;
+        }
+        long long b = numbers.back(); numbers.pop_back();
+        long long a = numbers.back(); numbers.pop_back();
+        char op = operators.back(); operators.pop_back();
+        numbers.push_back(calculateBasicOperation(a, b, op));
+        if (errorOccurred) return 0;
+      }
+      operators.push_back(c);
+      expectingNumber = true;
+    }
+    else if (c >= '0' && c <= '9') {
+      currentNum += c;
+      expectingNumber = false;
+    }
+  }
+  
+  if (!currentNum.isEmpty()) {
+    numbers.push_back(atoll(currentNum.c_str()));
+  }
+  
+  while (!operators.empty()) {
+    if (operators.back() == '(') {
+      errorOccurred = true;
+      return 0;
+    }
+    if (numbers.size() < 2) {
+      errorOccurred = true;
+      return 0;
+    }
+    long long b = numbers.back(); numbers.pop_back();
+    long long a = numbers.back(); numbers.pop_back();
+    char op = operators.back(); operators.pop_back();
+    numbers.push_back(calculateBasicOperation(a, b, op));
+    if (errorOccurred) return 0;
+  }
+  
+  if (numbers.empty()) {
+    errorOccurred = true;
+    return 0;
+  }
+  
+  return numbers.back();
+}
+
+long long calculateBasicOperation(long long a, long long b, char op) {
+  switch (op) {
+    case '+':
+      if ((b > 0 && a > LLONG_MAX - b) || (b < 0 && a < LLONG_MIN - b)) {
+        errorOccurred = true;
+        return 0;
+      }
+      return a + b;
+    case '-':
+      if ((b < 0 && a > LLONG_MAX + b) || (b > 0 && a < LLONG_MIN + b)) {
+        errorOccurred = true;
+        return 0;
+      }
+      return a - b;
+    case '*':
+      if (willMultiplyOverflow(a, b)) {
+        errorOccurred = true;
+        return 0;
+      }
+      return a * b;
+    case '/':
+      if (b == 0) {
+        errorOccurred = true; // Division by zero error
+        return 0;
+      }
+      return a / b;
+    case '^': {
+      long long result = power(a, b);
+      if (errorOccurred) return 0;
+      return result;
+    }
+    case '%':
+      if (b == 0) {
+        errorOccurred = true; // Division by zero error
+        return 0;
+      }
+      return a % b;
+    default:
+      errorOccurred = true;
+      return 0;
+  }
+}
+
+void displayText(String text) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.print(text);
+  display.display();
+}
+
+void clearCalculator() {
+  expression = "";
+  currentNumber = "";
+  errorOccurred = false;
+  display.clearDisplay();
+  displayText("Calculator Ready");
+}
